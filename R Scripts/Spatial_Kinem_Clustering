@@ -1,0 +1,294 @@
+
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(uwot)       # UMAP
+library(mclust)     # GMM
+library(scales)
+library(cluster)    # silhouette scoring
+library(RColorBrewer)
+library(harmony)
+
+
+
+sheets <- c("SHAM_S1",
+            "SHAM_S2",
+            "SHAM_S3")
+
+UMAP_DATA <- bind_rows(lapply(sheets, function(s) {
+  read_excel("SAMPLE_DATA.xlsx", sheet = s) %>%
+    mutate(
+      source_sheet = s,
+      x_orig = x,
+      y_orig = y
+    )
+}))
+
+
+# Filter data
+UMAP_DATA <- UMAP_DATA %>% filter(Calcein >= 0.1 & mag >=0.1)
+head(UMAP_DATA)
+
+# Per-sheet z-score normalization
+features_scaled <- UMAP_DATA %>%
+  group_by(source_sheet) %>%
+  mutate(across(c(x, y, mag, tan, dx, dy, Calcein), ~ as.numeric(scale(.)))) %>%
+  ungroup() %>%
+  select(x, y, mag, tan, dx, dy, Calcein)
+
+# Apply weights
+weight_factors <- c(x=1, y=1, mag=10, tan=10, dx=10, dy=10, Calcein=1)
+features_weighted <- sweep(features_scaled, 2, weight_factors, `*`)
+
+
+# Run Harmony and separate by region so no biology would be normalized out
+com_data <- UMAP_DATA %>% filter(REGION == "COM")
+tra_data <- UMAP_DATA %>% filter(REGION == "TRA")
+
+run_harmony <- function(df) {
+  
+  # Scale per sheet
+  df_scaled <- df %>%
+    group_by(source_sheet) %>%
+    mutate(across(c(x, y, mag, tan, dx, dy, Calcein),
+                  ~ as.numeric(scale(.)))) %>%
+    ungroup()
+  
+  features <- df_scaled %>%
+    select(x, y, mag, tan, dx, dy, Calcein)
+  
+  # Apply weights
+  features_weighted <- sweep(features, 2, weight_factors, `*`)
+  
+  # Harmony correction (ONLY sheet)
+  harmony_out <- HarmonyMatrix(
+    data_mat = as.matrix(features_weighted),
+    meta_data = df_scaled,
+    vars_use = "source_sheet"
+  )
+  
+  return(list(
+    harmony = harmony_out,
+    meta = df_scaled
+  ))
+}
+
+com_res <- run_harmony(com_data)
+tra_res <- run_harmony(tra_data)
+
+combined_harmony <- rbind(com_res$harmony, tra_res$harmony)
+digest::digest(combined_harmony) # check if the harmony is the same
+combined_meta <- bind_rows(com_res$meta, tra_res$meta)
+
+
+# DIMENSIONALITY REDUCTION
+
+set.seed(42)
+umap_coords <- umap(
+  combined_harmony,
+  n_neighbors = 30,    # smaller -> more local
+  min_dist = 0.15,      # smaller -> tighter clusters
+  metric = "cosine",
+  n_threads = 1
+)
+umap_coords <- as.data.frame(umap_coords)
+colnames(umap_coords) <- c("UMAP1", "UMAP2")
+
+data_umap <- cbind(combined_meta, umap_coords)
+
+# sanity check (clusters not separated by sheets/samples/batches)
+ggplot(data_umap, aes(UMAP1, UMAP2, color = source_sheet)) +
+  geom_point(alpha = 0.5)
+
+
+# GMM CLUSTERING 
+coords <- data_umap[, c("UMAP1", "UMAP2")]
+
+candidate_G <- 2:8
+
+results <- data.frame(
+  G = candidate_G,
+  BIC = NA,
+  silhouette = NA
+)
+
+gmm_models <- vector("list", length(candidate_G))
+
+for (j in seq_along(candidate_G)) {
+  G <- candidate_G[j]
+
+  gmm_fit <- Mclust(coords, G = G)
+  gmm_models[[j]] <- gmm_fit
+
+  # BIC
+  results$BIC[j] <- gmm_fit$bic
+
+  # Silhouette
+  if (length(unique(gmm_fit$classification)) > 1) {
+    sil <- silhouette(gmm_fit$classification, dist(coords))
+    results$silhouette[j] <- mean(sil[, 3])
+  }
+}
+
+
+# Plot silhouette and BIC for user selection
+ggplot(results, aes(x = BIC, y = silhouette, label = G)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.8) +
+  theme_bw() +
+  labs(title = "Silhouette vs BIC (Global)",
+       x = "BIC (higher = better)",
+       y = "Mean silhouette (higher = better)")
+
+
+chosen_G_global <- 6   # change anytime depending on the scores
+
+coords <- data_umap[, c("UMAP1", "UMAP2")]
+
+final_gmm <- Mclust(coords, G = chosen_G_global)
+
+data_umap$cluster_gmm_global <-
+  paste0("C", final_gmm$classification)
+
+cluster_names <- unique(data_umap$cluster_gmm_global)
+
+cluster_colors <- setNames(
+  colorRampPalette(brewer.pal(12, "Paired"))(length(cluster_names)),
+  cluster_names
+)
+
+
+# PLOT CLUSTERS
+
+p.global <- ggplot(data_umap,
+                   aes(UMAP1, UMAP2, color = cluster_gmm_global)) +
+  geom_point(size = 0.5, alpha = 0.8) +
+  scale_color_manual(values = cluster_colors) +
+  labs(color = NULL) +
+  theme_minimal(base_size = 25) +
+  theme(panel.border = element_blank(),
+        panel.grid = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.title = element_text(size=20),
+        legend.text = element_text(size=20)) +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+ggsave("UMAP_CLUSTER_SHAM.png", plot = p.global, width = 8, height = 5, dpi = 500)
+
+
+p.region <- ggplot(data_umap, aes(UMAP1, UMAP2, color = REGION)) +
+  geom_point(size = 0.5, alpha = 0.8) +
+  scale_color_manual(values = c("TRA"="#238B45", "COM"="#EC7014")) +
+  labs(color = NULL) +
+  theme_minimal(base_size = 25) +
+  theme(panel.border = element_blank(),
+        panel.grid = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.title = element_text(size=20),
+        legend.text = element_text(size=20)) +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+ggsave("UMAP_REGION_SHAM.png", plot=p.region, width=8, height=5, dpi=500)
+
+
+
+
+# For every unique (x_orig, y_orig) location, compute the most frequent cluster across all sheets. 
+
+consensus_clusters <- data_umap %>%
+  group_by(x_orig, y_orig) %>%
+  summarise(
+    cluster_consensus = names(sort(table(cluster_gmm_global), decreasing = TRUE))[1],
+    .groups = "drop"
+  )
+
+p.spatial.consensus <- consensus_clusters %>%
+  ggplot(aes(x = x_orig, y = y_orig, color = cluster_consensus)) +
+  geom_point(size = 0.3, alpha = 0.8) +
+  scale_color_manual(values = cluster_colors) +
+  scale_y_reverse() +
+  labs(color = NULL, x = "x", y = "y") +
+  theme_minimal(base_size = 25) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    panel.grid = element_blank(),
+    axis.title = element_text(size = 20),
+    axis.text = element_blank(),
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20)
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+ggsave("SPATIAL_CLUSTER_CONSENSUS_SHAM.png", plot=p.spatial.consensus, width=8, height=5, dpi=500)
+
+
+# same idea, determine the most frequent REGION
+
+consensus_region <- data_umap %>%
+  group_by(x_orig, y_orig) %>%
+  summarise(
+    REGION_consensus = names(sort(table(REGION), decreasing = TRUE))[1],
+    .groups = "drop"
+  )
+
+
+p.spatial.region.consensus <- consensus_region %>%
+  ggplot(aes(x = x_orig, y = y_orig, color = REGION_consensus)) +
+  geom_point(size = 0.3, alpha = 0.8) +
+  scale_color_manual(values = c("TRA" = "#238B45", "COM" = "#EC7014")) +
+  scale_y_reverse() +
+  labs(color = NULL, x = "x", y = "y") +
+  theme_minimal(base_size = 25) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    panel.grid = element_blank(),
+    axis.title = element_text(size = 20),
+    axis.text = element_blank(),
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20)
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+ggsave("SPATIAL_REGION_CONSENSUS_SHAM.png", plot=p.spatial.region.consensus, width=8, height=5, dpi=500)
+
+
+
+
+# proportions per cluster
+
+prop_df <- data_umap %>%
+  group_by(cluster_gmm_global, REGION) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(cluster_gmm_global) %>%
+  mutate(prop = n / sum(n))
+
+prop_df$cluster_gmm_global <- factor(
+  prop_df$cluster_gmm_global,
+  levels = paste0("C", 1:chosen_G_global)
+)
+
+p.proportion <- ggplot(prop_df, aes(x = cluster_gmm_global, y = prop, fill = REGION)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values=c("TRA"="#238B45","COM"="#EC7014")) +
+  theme_bw() +
+  theme(panel.border=element_rect(color="black",fill=NA,size=1),
+        panel.grid=element_blank(),
+        axis.title=element_text(size=20),
+        axis.text.x = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=20)) +
+  labs(
+    x = "Cluster",
+    y = "Proportion",
+    fill = NULL
+  )
+
+ggsave("PROPORTION_REGION_SHAM.png", plot=p.proportion, width=8, height=5, dpi=500)
+
+# SAVE RESULTS
+write.csv(data_umap, "UMAP_GMM_GLOBAL_CLUSTERING_SHAM_ALL.csv", row.names=FALSE)
