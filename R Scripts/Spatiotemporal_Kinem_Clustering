@@ -1,0 +1,292 @@
+
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(uwot)       # UMAP
+library(mclust)     # GMM
+# in mclust package, the BIC is the negative value of standard BIC, so pick the highest BIC result
+library(scales)
+library(cluster)    # silhouette scoring
+library(RColorBrewer)
+library(igraph)
+library(FNN)  # for kNN graph
+
+
+UMAP_DATA <- read_excel("SAMPLE_DATA.xlsx", sheet = "SHAM_HR")
+
+UMAP_DATA <- UMAP_DATA %>% filter(mag >= 0.1, SAMPLE == "S1")
+
+head(UMAP_DATA)
+
+features <- UMAP_DATA %>%
+  select(x, y, mag, tan, dx, dy)
+
+# remove rows with NA first
+complete_idx <- complete.cases(features)
+features <- features[complete_idx, ]
+UMAP_DATA <- UMAP_DATA[complete_idx, ]
+
+# Scale features
+features_scaled <- scale(features)
+
+# adjust weight for different parameters
+weight_factors <- c(x=1, y=1, mag=20, tan=20, dx=5, dy=5)
+features_weighted <- sweep(features_scaled, 2, weight_factors, `*`)
+
+
+set.seed(42)
+umap_coords <- umap(
+  features_weighted,
+  n_neighbors = 30,    # smaller -> more local
+  min_dist = 0.3,      # smaller -> tighter clusters
+  metric = "euclidean"
+  #metric = "cosine"
+)
+umap_coords <- as.data.frame(umap_coords)
+colnames(umap_coords) <- c("UMAP1", "UMAP2")
+
+data_umap <- cbind(UMAP_DATA, umap_coords)
+
+
+
+# Region-aware GMM Clustering based on BIC vs silhouette
+
+# comparison_list <- list()
+# clustered_list <- list()
+# 
+# data_umap_region <- data_umap %>%
+#   group_by(region) %>%
+#   group_split()
+# 
+# for (i in seq_along(data_umap_region)) {
+#   
+#   region_data <- data_umap_region[[i]]
+#   region_name <- unique(region_data$region)
+#   
+#   cat("\n======================================\n")
+#   cat("Processing region:", region_name, "\n")
+#   cat("======================================\n")
+#   
+#   coords <- region_data[, c("UMAP1", "UMAP2")]
+#   candidate_G <- 2:5
+#   
+#   results <- data.frame(
+#     region = region_name,
+#     G = candidate_G,
+#     BIC = NA,
+#     silhouette = NA
+#   )
+#   
+#   gmm_models <- vector("list", length(candidate_G))
+#   
+#   for (j in seq_along(candidate_G)) {
+#     G <- candidate_G[j]
+#     
+#     gmm_fit <- Mclust(coords, G = G)
+#     gmm_models[[j]] <- gmm_fit
+#     
+#     # BIC
+#     results$BIC[j] <- gmm_fit$bic
+#     
+#     # Silhouette
+#     if (length(unique(gmm_fit$classification)) > 1) {
+#       sil <- silhouette(gmm_fit$classification, dist(coords))
+#       results$silhouette[j] <- mean(sil[, 3])
+#     }
+#   }
+#   
+#   comparison_list[[region_name]] <- results
+#   
+#   # ---- Choose best G ----
+#   best_G_bic <- results$G[which.max(results$BIC)]
+#   best_G_sil <- results$G[which.max(results$silhouette)]
+#   
+#   cat("Best G by BIC:", best_G_bic, "\n")
+#   cat("Best G by silhouette:", best_G_sil, "\n")
+#   
+#   # ---- Final clustering (choose silhouette here, can switch) ----
+#   best_gmm <- gmm_models[[which(candidate_G == best_G_sil)]]
+#   
+#   region_data$cluster_gmm_region <-
+#     paste0(region_name, "_", best_gmm$classification)
+#   
+#   clustered_list[[i]] <- region_data
+# }
+# 
+# comparison_df <- bind_rows(comparison_list)
+# data_umap_region_clustered <- bind_rows(clustered_list)
+# 
+# ggplot(comparison_df,
+#        aes(x = BIC, y = silhouette, label = G)) +
+#   geom_point(size = 3) +
+#   geom_text(vjust = -0.8) +
+#   facet_wrap(~ region, scales = "free") +
+#   theme_bw() +
+#   labs(title = "Silhouette vs BIC tradeoff",
+#        x = "BIC (higher = better)",
+#        y = "Mean silhouette (higher = better)")
+
+
+
+# USER SELECTED # OF CLUSTERS
+
+chosen_G_by_region <- c(
+  COM = 3,
+  TRA = 4
+)
+
+# Initialize lists
+sil_region_list <- list()
+clustered_list <- list()
+
+for (i in seq_along(data_umap_region)) {
+  
+  region_data <- data_umap_region[[i]]
+  region_name <- unique(region_data$region)
+  
+  cat("\n======================================\n")
+  cat("Processing region:", region_name, "\n")
+  cat("======================================\n")
+  
+  coords <- region_data[, c("UMAP1", "UMAP2")]
+  
+  # ---- Get user-chosen G ----
+  best_G <- chosen_G_by_region[region_name]
+  
+  if (is.na(best_G)) {
+    stop(paste("No chosen G defined for region:", region_name))
+  }
+  
+  cat("Using user-selected G =", best_G, "\n")
+  
+  # ---- Fit final GMM ----
+  best_gmm <- Mclust(coords, G = best_G)
+  
+  # ---- Compute silhouette ----
+  if (length(unique(best_gmm$classification)) > 1) {
+    sil <- silhouette(best_gmm$classification, dist(coords))
+    mean_sil <- mean(sil[, 3])
+  } else {
+    sil <- NULL
+    mean_sil <- NA
+  }
+  
+  cat("Mean silhouette for region", region_name, "=",
+      round(mean_sil, 3), "\n")
+  
+  # ---- Assign cluster labels ----
+  region_data$cluster_gmm_region <-
+    paste0(region_name, "_", best_gmm$classification)
+  
+  # ---- Store per-cluster silhouette ----
+  if (!is.null(sil)) {
+    sil_df <- data.frame(
+      cluster = unique(region_data$cluster_gmm_region),
+      silhouette = tapply(sil[, 3],
+                          region_data$cluster_gmm_region,
+                          mean)
+    )
+  } else {
+    sil_df <- data.frame(
+      cluster = unique(region_data$cluster_gmm_region),
+      silhouette = NA
+    )
+  }
+  
+  sil_region_list[[region_name]] <- sil_df
+  clustered_list[[i]] <- region_data
+}
+
+data_umap_region_clustered <- do.call(rbind, clustered_list)
+
+
+cluster_names <- unique(data_umap_region_clustered$cluster_gmm_region)
+cluster_colors <- setNames(
+  colorRampPalette(brewer.pal(12, "Paired"))(length(cluster_names)),
+  cluster_names
+)
+
+
+
+# PLOTTING
+
+# Colored by region-aware clusters
+p.cluster <- ggplot(data_umap_region_clustered, aes(UMAP1, UMAP2, color=cluster_gmm_region)) +
+  geom_point(size=2, alpha=0.8) +
+  scale_color_manual(values=cluster_colors) +
+  labs(color=NULL) +
+  theme_minimal(base_size=25) +
+  theme(panel.border = element_blank(),
+        panel.grid=element_blank(),
+        axis.title=element_blank(),
+        axis.text=element_blank(),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=20))
+
+ggsave("UMAP_CLUSTER_SHAM_S1_HR.png", plot=p.cluster, width=8, height=5, dpi=500)
+
+
+# colored by region-aware clusters, only selected time showed up
+
+p.cluster_HR <- ggplot(data_umap_region_clustered, aes(UMAP1, UMAP2)) +
+  ## Background: all other HR values in gray
+  geom_point(
+    data = dplyr::filter(data_umap_region_clustered, !HR %in% c(0.5, 1)),
+    color = "grey80",
+    size = 2,
+    alpha = 0.4
+  ) +
+  ## Foreground: HR <= 1 colored by cluster
+  geom_point(
+    data = dplyr::filter(data_umap_region_clustered, HR %in% c(0.5, 1)),
+    aes(color = cluster_gmm_region),
+    size = 2,
+    alpha = 0.9
+  ) +
+  scale_color_manual(values = cluster_colors) +
+  labs(color = NULL) +
+  theme_minimal(base_size = 25) +
+  theme(
+    panel.border = element_blank(),
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20)
+  )
+ggsave("UMAP_CLUSTER_SHAM_S1_HR1.png", plot=p.cluster_HR, width=8, height=5, dpi=500)
+
+
+
+# Spatial colored by clusters
+p.spatial.cluster <- ggplot(
+  data_umap_region_clustered %>% dplyr::filter(HR %in% c(0.5, 1)),
+  aes(x, y, color=cluster_gmm_region)) +
+  geom_point(size=2, alpha=0.8) +
+  scale_color_manual(values=cluster_colors) +
+  scale_y_reverse() +
+  labs(color=NULL) +
+  theme_minimal(base_size=25) +
+  theme(panel.border=element_rect(color="black",fill=NA,size=1),
+        panel.grid=element_blank(),
+        axis.title=element_text(size=20),
+        axis.text=element_blank(),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=20))
+
+ggsave("SPATIAL_CLUSTER_SHAM_S1_HR1.png", plot=p.spatial.cluster, width=8, height=5, dpi=500)
+
+
+
+# SAVE RESULTS
+write.csv(data_umap_region_clustered, "UMAP_GMM_Region_Clusters_Sham_S1_HR.csv", row.names=FALSE)
+
+
+
+
+
+
+
+
+
