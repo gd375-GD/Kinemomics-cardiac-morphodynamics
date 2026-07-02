@@ -1,0 +1,458 @@
+
+
+### SPATIAL QUANTIFICATION AND PLOTTING
+
+
+# For EACH sample:
+# 
+# Detect physical boundary (COM–TRA)
+#
+# Compute:
+# slope (developmental speed)
+# variability (temporal heterogeneity)
+# activity (speed × heterogeneity)
+#
+# Smooth fields using Thin Plate Spline
+#
+# Compute ∇(activity) --> dynamic front
+#
+# Label dynamic boundary
+#
+# compute front sharpness (grad mag)
+# compute divergence
+# compute Moran's Index for spatial autocorrelation of front cells
+# Attach region + boundary info
+# 
+# Then:
+# Combine all samples
+# Compute % dynamic boundary per region per group
+# Ready for plotting/statistics
+
+
+
+library(readxl)
+library(dplyr)
+library(FNN)
+library(fields)  # for Gaussian smoothing (Tps)
+library(ggplot2)
+library(caret)
+library(ggpubr) # for stat_compare_means
+library(purrr)
+library(readr)  # for read_csv
+library(spdep) # compute Moran's I
+
+
+
+files <- c(
+  "UMAP_Trajectory_Pseudotime_Sham_S1_HR.csv"
+  # add more files here
+)
+
+groups <- c(
+  "SHAM"
+  # add more groups here
+)
+
+
+process_sample <- function(file, group_name) {
+  
+  df <- read_csv(file)
+  
+  # ----------------------------
+  # A. Detect physical boundary
+  # ----------------------------
+  coords <- as.matrix(df[, c("x", "y")])
+  radius <- 100
+  
+  nn <- get.knnx(coords, coords, k = nrow(df))
+  
+  neighbor_list <- lapply(1:nrow(df), function(i) {
+    idx <- nn$nn.index[i, ]
+    dist <- nn$nn.dist[i, ]
+    idx[dist > 0 & dist <= radius]
+  })
+  
+  df$region_boundary <- df$region
+  
+  for (i in seq_along(neighbor_list)) {
+    neighbors <- neighbor_list[[i]]
+    
+    if (length(neighbors) > 0 &&
+        any(df$region[neighbors] != df$region[i])) {
+      df$region_boundary[i] <- "BOUNDARY"
+    }
+  }
+  
+  df$region_boundary <- factor(df$region_boundary,
+                               levels = c("COM", "BOUNDARY", "TRA"))
+  
+  # ----------------------------
+  # B. Compute slope
+  # ----------------------------
+  df <- df %>%
+    group_by(x, y) %>%
+    arrange(HR, .by_group = TRUE) %>%
+    mutate(
+      slope = coef(lm(pseudotime ~ HR))[2]
+    ) %>%
+    ungroup()
+  
+  # ----------------------------
+  # C. Activity per (x,y)
+  # ----------------------------
+  df_activity <- df %>%
+    group_by(x, y) %>%
+    summarise(
+      slope = coef(lm(pseudotime ~ HR))[2],
+      variability = sd(pseudotime, na.rm = TRUE),
+      activity = pmax(slope, 0) * variability,
+      .groups = "drop"
+    )
+  
+  coords <- as.matrix(df_activity[, c("x", "y")])
+  
+  # ----------------------------
+  # D. Gaussian smoothing
+  # ----------------------------
+  # Smooth slope
+  tps_slope <- Tps(coords, df_activity$slope)
+  df_activity$slope_smooth <- predict(tps_slope, coords)
+  
+  # Smooth variability
+  tps_var <- Tps(coords, df_activity$variability)
+  df_activity$variability_smooth <- predict(tps_var, coords)
+  
+  # Smooth activity
+  tps_activity <- Tps(coords, df_activity$activity)
+  df_activity$activity_smooth <- predict(tps_activity, coords)
+  
+  # ----------------------------
+  # E. Gradient of scalar field activity (dynamic front)
+  # Local least-square gradient of activity
+  # ----------------------------
+  nn <- get.knnx(coords, coords, k = nrow(df_activity))
+  
+  vectors <- lapply(1:nrow(df_activity), function(i) {
+    idx <- nn$nn.index[i, ]
+    dist <- nn$nn.dist[i, ]
+    
+    keep <- which(dist > 0 & dist <= radius)
+    neighbors <- idx[keep]
+    
+    if (length(neighbors) < 3) return(c(NA, NA))
+    
+    dx <- df_activity$x[neighbors] - df_activity$x[i]
+    dy <- df_activity$y[neighbors] - df_activity$y[i]
+    da <- df_activity$activity_smooth[neighbors] - df_activity$activity_smooth[i]
+    
+    gx <- sum(da * dx) / sum(dx^2 + dy^2)
+    gy <- sum(da * dy) / sum(dx^2 + dy^2)
+    
+    c(gx, gy)
+  })
+  
+  vectors <- do.call(rbind, vectors)
+  
+  df_activity$grad_mag <- sqrt(vectors[,1]^2 + vectors[,2]^2)
+  
+  
+  # ----------------------------
+  # F. Compute divergence (mesh-free Laplacian approximation)
+  # Laplacian of the scalar field activity, not divergence directly
+  # But it is the divergence of the gradient 
+  # ----------------------------
+  
+  # positive: source (spreading out -> expanding fronts)
+  # negative: sink (concentrating -> converging fronts)
+  
+  coords <- as.matrix(df_activity[, c("x", "y")])
+  nn <- get.knnx(coords, coords, k = nrow(df_activity))
+  radius <- 100
+  
+  divergence <- sapply(1:nrow(df_activity), function(i) {
+    
+    idx <- nn$nn.index[i, ]
+    dist <- nn$nn.dist[i, ]
+    
+    keep <- which(dist > 0 & dist <= radius)
+    neighbors <- idx[keep]
+    
+    if(length(neighbors) < 4) return(NA)
+    
+    center_val <- df_activity$activity_smooth[i]
+    neighbor_vals <- df_activity$activity_smooth[neighbors]
+    
+    dx <- df_activity$x[neighbors] - df_activity$x[i]
+    dy <- df_activity$y[neighbors] - df_activity$y[i]
+    dist2 <- dx^2 + dy^2
+    
+    # Laplacian approximation
+    lap <- sum((neighbor_vals - center_val) / dist2) / length(neighbors)
+    
+    lap
+  })
+  
+  df_activity$divergence <- divergence
+  
+  # ----------------------------
+  # G. Dynamic boundary
+  # ----------------------------
+  threshold <- quantile(df_activity$grad_mag, 0.8, na.rm = TRUE)
+  
+  df_activity <- df_activity %>%
+    mutate(dynamic_boundary = grad_mag > threshold)
+  
+  # ----------------------------
+  # H. Attach region + metadata
+  # ----------------------------
+  df_activity <- df_activity %>%
+    left_join(
+      df %>% select(x, y, region, region_boundary) %>% distinct(),
+      by = c("x", "y")
+    )
+  
+  df_activity$group <- group_name
+  df_activity$sample <- file
+  
+  # ----------------------------
+  # I. Compute Moran's I for dynamic boundary
+  # ----------------------------
+  coords <- as.matrix(df_activity[, c("x", "y")])
+  n <- nrow(df_activity)  # number of observations
+  nn <- get.knnx(coords, coords, k = n)  # compute distances between all points
+  
+  nb_list <- vector("list", n)
+  for (i in 1:n) {
+    idx <- nn$nn.index[i, ]
+    dist <- nn$nn.dist[i, ]
+    nb_list[[i]] <- idx[dist > 0 & dist <= radius]  # define neighbors as those within radius
+  }
+  class(nb_list) <- "nb"  
+  listw <- nb2listw(nb_list, style = "W", zero.policy = TRUE)  # spatial weights
+  
+  moran_res <- moran.test(df_activity$dynamic_boundary*1, listw, zero.policy = TRUE)
+  df_activity$moran_dynamic <- as.numeric(moran_res$estimate["Moran I statistic"])
+  
+  return(df_activity)
+}
+
+
+# RUN THE PROCESS FUNCTION FOR ALL SAMPLES
+df_all <- map2_dfr(files, groups, process_sample)
+
+
+
+# POST-PROCESSING
+# Compute % dynamic boundary per region per group
+summary_df <- df_all %>%
+  group_by(group, sample, region_boundary) %>%
+  summarise(
+    total_cells = n(),
+    dynamic_cells = sum(dynamic_boundary, na.rm = TRUE),
+    percent_dynamic = 100 * dynamic_cells / total_cells,
+    .groups = "drop"
+  )
+
+# Aggregate across samples (mean ± variation)
+summary_group <- summary_df %>%
+  group_by(group, region_boundary) %>%
+  summarise(
+    mean_percent = mean(percent_dynamic, na.rm = TRUE),
+    sd_percent = sd(percent_dynamic, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(summary_group)
+
+
+# Moran's I summary per sample & group
+moran_region_summary <- df_all %>%
+  group_by(sample, group, region_boundary) %>%
+  summarise(
+    moran_dynamic = {
+      df_sub <- cur_data()
+      coords <- as.matrix(df_sub[, c("x", "y")])
+      n <- nrow(df_sub)
+      
+      # Check if enough points and variability
+      if (n < 3 || var(df_sub$dynamic_boundary*1) == 0) {
+        NA  # Cannot compute Moran's I
+      } else {
+        nn <- get.knnx(coords, coords, k = n)
+        nb_list <- vector("list", n)
+        for (i in 1:n) {
+          idx <- nn$nn.index[i, ]
+          dist <- nn$nn.dist[i, ]
+          nb_list[[i]] <- idx[dist > 0 & dist <= 100]  # radius=100
+        }
+        class(nb_list) <- "nb"
+        listw <- nb2listw(nb_list, style = "W", zero.policy = TRUE)
+        moran_res <- moran.test(df_sub$dynamic_boundary*1, listw, zero.policy = TRUE)
+        as.numeric(moran_res$estimate["Moran I statistic"])
+      }
+    },
+    .groups = "drop"
+  )
+
+print(moran_region_summary)
+
+# Aggregate by group
+moran_group_summary <- moran_summary %>%
+  group_by(group) %>%
+  summarise(
+    mean_moran = mean(moran_dynamic, na.rm = TRUE),
+    sd_moran = sd(moran_dynamic, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(moran_group_summary)
+
+
+
+# Join Moran's I per region with percent_dynamic per region
+# High values would indicate densely clustered fronts
+# low or negative values indicate sparse or dispersed fronts.
+moran_percent_df <- summary_df %>%
+  left_join(moran_region_summary, 
+            by = c("sample", "group", "region_boundary")) %>%
+  mutate(
+    Moran_percent = moran_dynamic * percent_dynamic
+  )
+
+
+# Compute stability per region per sample = grad_mag × divergence
+stability_df <- df_all %>%
+  group_by(sample, group, region_boundary) %>%
+  summarise(
+    mean_grad = mean(grad_mag, na.rm = TRUE),
+    mean_div = mean(divergence, na.rm = TRUE),
+    stability = -mean(grad_mag * divergence, na.rm = TRUE),
+    percent_dynamic = mean(dynamic_boundary*100, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(moran_region_summary, by = c("sample", "group", "region_boundary")) %>%
+  mutate(
+    Moran_percent_dynamic = moran_dynamic,  # y-axis
+    size_metric = stability
+  )
+
+
+# PLOTTING
+
+
+
+plot_spatial <- function(df, value_col, title, limits, file_name) {
+  
+  p <- ggplot(df, aes(x, y, color = .data[[value_col]])) +
+    geom_point(size = 2, alpha = 0.8) +
+    scale_color_viridis_c(limits = limits, oob = scales::squish) +
+    scale_y_reverse() +
+    labs(color = title) + 
+    theme_minimal(base_size = 25) +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, size = 1),
+      panel.grid = element_blank(),
+      axis.title = element_text(size = 20),
+      axis.text = element_blank(),
+      legend.title = element_text(size = 20),
+      legend.text = element_text(size = 20)
+    )
+  
+  ggsave(file_name, plot = p, width = 8, height = 5, dpi = 500)
+}
+
+
+plot_front_continuous <- function(df, file_name) {
+  
+  p <- ggplot(df, aes(x, y, color = grad_mag)) +
+    geom_point(size = 2, alpha = 0.8) +
+    # scale_color_viridis_c(limits = c(0, quantile(df$grad_mag, 0.95, na.rm=TRUE)),
+    #                       oob = scales::squish) +
+    scale_color_viridis_c(limits = c(0, 0.12), oob = scales::squish) +
+    scale_y_reverse() +
+    labs(color = "gradient") +
+    theme_minimal(base_size = 25) +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, size = 1),
+      panel.grid = element_blank(),
+      axis.text = element_blank()
+    )
+  
+  ggsave(file_name, plot = p, width = 8, height = 5, dpi = 500)
+}
+
+
+plot_front_with_regions <- function(df, file_name) {
+  
+  region_colors <- c("COM" = "#FDBE85","BOUNDARY" = "gray80","TRA" = "#A1D99B")
+  
+  p <- ggplot(df, aes(x, y)) +
+    
+    # Background: anatomical regions
+    geom_point(aes(color = region_boundary), 
+               size = 1.5, alpha = 0.8) +
+    
+    # Overlay: dynamic boundary (developmental front)
+    geom_point(
+      data = df %>% filter(dynamic_boundary),
+      color = "black",
+      size = 2
+    ) +
+    
+    scale_color_manual(values = region_colors) +
+    scale_y_reverse() +
+    
+    labs(color = "Region") +
+    
+    theme_minimal(base_size = 25) +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, size = 1),
+      panel.grid = element_blank(),
+      axis.text = element_blank(),
+      legend.title = element_text(size = 20),
+      legend.text = element_text(size = 20)
+    )
+  
+  ggsave(file_name, plot = p, width = 8, height = 5, dpi = 500)
+}
+
+
+
+walk2(files, groups, function(file, group_name) {
+  
+  df_activity <- process_sample(file, group_name)
+  
+  # extract clean sample name
+  sample_name <- gsub(".csv", "", basename(file))
+  
+  # -----------------------
+  # Spatial maps
+  # -----------------------
+  plot_spatial(df_activity, "slope_smooth", "Speed",
+               limits = c(0, 10),
+               paste0("SPATIAL_SLOPE_", sample_name, ".png"))
+  
+  plot_spatial(df_activity, "variability_smooth", "Hetero",
+               limits = c(0, 10),
+               paste0("SPATIAL_HETERO_", sample_name, ".png"))
+  
+  plot_spatial(df_activity, "activity_smooth", "Activity",
+               limits = c(0, 50),
+               paste0("SPATIAL_ACTIVITY_", sample_name, ".png"))
+  
+  # -----------------------
+  # Developmental front (largest 20%, aka threshold = 0.8)
+  # -----------------------
+  plot_front_continuous(df_activity,
+                        paste0("SPATIAL_FRONT_CONT_", sample_name, ".png"))
+  
+  plot_front_with_regions(df_activity,
+                          paste0("SPATIAL_FRONT_BINARY_", sample_name, ".png"))
+})
+
+
+
+
+
+
+
