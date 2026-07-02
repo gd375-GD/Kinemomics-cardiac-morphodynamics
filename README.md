@@ -15,7 +15,7 @@
 
 **System and Package Requirement:** 
 
-* R version 4.5.2 (2025-10-31 ucrt)
+* R version 4.5.2 (2025-10-31 ucrt), see https://cran.r-project.org/bin/windows/base/old/4.5.2/ 
 * Platform: x86_64-w64-mingw32/x64
 * Running under: Windows 11 x64 (build 26200)
 * SingleCellExperiment_1.32.0
@@ -25,5 +25,10 @@
 * mclust_6.1.2
 * cluster_2.1.8.2
 * spdep_1.4-2
+
+
+**Input (sample data):** Data sheet containing spatially resolved local live migratory kinematics at different time points during timelapse imaging. For every spatial location, normalized mean fluorescent intensities of endpoint immunofluorescent imaging were extracted. Local displacements, migration directions, and fluorescent intensities of biomolecules were stored in the same x and y position for analysis.
+
+**Output:** Cluster, pseudotime, developmental progression/trajectory on UMAP and coresponding spatial maps at the original coordinates.
 
 Expected run time for demo on a normal pc: within 10 min
